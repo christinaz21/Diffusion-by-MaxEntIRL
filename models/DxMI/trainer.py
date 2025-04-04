@@ -161,6 +161,7 @@ class DxMI_Trainer:
                 end=self.q_beta_end,
             )
 
+    # line 7:  tau / (2 * s_t^2) * (x_t - x_{t+1})^2
     def get_running_cost(self, state, next_state, pred_mean, pred_std, t):
         """compute running cost given transition"""
         t_reversed = (self.n_timesteps - t - 1)
@@ -190,6 +191,7 @@ class DxMI_Trainer:
             with torch.enable_grad():
                 next_x = next_x.requires_grad_(True)
                 # DDP does not support autograd.grad. So we use v.module.
+                # calculates value of next sample
                 if isinstance(self.v, torch.nn.parallel.DistributedDataParallel):
                     value = self.v.module(next_x, tt+1).squeeze()
                 else:
@@ -225,7 +227,8 @@ class DxMI_Trainer:
         # from t=0 to t=T-1
         diff = (samples[1:] - samples[:-1]) ** 2
         diff = diff.view(diff.shape[0], -1).mean(dim=1).flip(0).to(device)
-
+        
+        # s_t^2 = a * s_t^2 + (1-a) * (x_t - x_{t-1})^2
         self.betas_for_q = (self.betas_for_q.to(device) * self.adavelreg + (1 - self.adavelreg) * diff).detach()
 
     def update_f_v(self, img, d_sample, state_dict):
@@ -234,31 +237,39 @@ class DxMI_Trainer:
             self.update_adaptive_vel_reg(d_sample)
 
         self.optimizer_v.zero_grad()
-        x0 = x_seq[-1]
+        x0 = x_seq[-1] # x0 is the final sample from the diffusion model, x_T
         n_steps = self.n_timesteps
         batchsize = self.batchsize
         device = img.device
+
+
+        ### ENERGY UPDATE ###
+        # set both energy and value function to training mode
         if self.f is not None:
             self.f.train()
         self.v.train()
         # treat the last step of value function as energy
         T = (n_steps) * torch.ones(len(img) + len(x0), dtype=torch.long).to(device)
-        inputs = torch.cat((img.detach(), x0.detach()),0)
+        # inputs = [real samples from p(x), generated samples from pi]
+        inputs = torch.cat((img.detach(), x0.detach()),0) 
 
         if self.f is None:
             output = self.v(inputs, T)
         else:
             output = self.f(inputs)
             
-        pos_e = output[:x0.shape[0]]
-        neg_e = output[x0.shape[0]:]
+        pos_e = output[:x0.shape[0]] # energy of real samples
+        neg_e = output[x0.shape[0]:] # energy of generated samples
+        # line 5: E(x) - E(x_T)
         d_loss = pos_e.mean()- neg_e.mean()
         if self.gamma is not None:
+            # line 5: E(x) - E(x_T) + gamma * (E(x)^2 + E(x_T)^2)
             reg = pos_e.pow(2).mean() + neg_e.pow(2).mean()
             d_loss += self.gamma * reg
         else:
             reg = torch.tensor(0)
         
+        # backprop through the energy function
         d_loss.backward()
         if self.f is None:
             self.optimizer_v.step()
@@ -266,8 +277,10 @@ class DxMI_Trainer:
         else:
             self.optimizer_fstar.step()
             self.optimizer_fstar.zero_grad()
-            self.f.eval()
+            self.f.eval() # set energy function to eval mode
 
+
+        ### VALUE UPDATE ###
         # temporal difference value estimation
         permutation = torch.randperm(batchsize * n_steps)
         indices = permutation + (state_dict['state'].shape[0] - (batchsize * n_steps))
@@ -275,7 +288,7 @@ class DxMI_Trainer:
         d_value = {}
 
         for i in range(n_steps):
-            update_t = (n_steps - i - 1)
+            update_t = (n_steps - i - 1) # reverses timesteps
             train_indices = torch.nonzero(state_dict["timestep"][indices] == update_t).flatten()
             state = state_dict["state"][indices][train_indices]
             timestep = state_dict["timestep"][indices][train_indices]
@@ -288,7 +301,10 @@ class DxMI_Trainer:
                 next_state = state_dict["next_state"][indices][train_indices]
                 pred_mean = state_dict["mean"][indices][train_indices]
                 pred_std = state_dict["sigma"][indices][train_indices] # (bs, 1, 1, 1)
+            # line 7: tau / (2 * s_t^2) * (x_t - x_{t+1})^2, velocity cost
             running_cost = self.get_running_cost(state, next_state, pred_mean, pred_std, timestep)
+            # H = -log(sigma_t)
+             # Line 7: tau * log(pi(x_{t + 1} | x_t)), simplifies to log(sigma_t) since Gaussian
             entropy = torch.log(pred_std.squeeze())
 
             self.v.eval()
@@ -298,28 +314,34 @@ class DxMI_Trainer:
                 target = v_xtp1 + running_cost * self.tau2
             else:
                 v_xtp1 = self.v(next_state, timestep+1).squeeze()
+            # target = V^(t+1)(x_{t + 1})
             target = v_xtp1
 
+            # encourages agent to move more quickly (not mentioned in paper)
             if self.time_cost_sig is not None:
                 center = self.n_timesteps // 2
                 target = target + self.time_cost_sig * torch.sigmoid(-timestep + center) \
                         - self.time_cost_sig * torch.sigmoid(-timestep - 1 + center)
-
+            
+            # encourages agent to terminate earlier
             if self.time_cost is not None:
                 target = target + self.time_cost
 
             if self.velocity_in_value is not None:
                 non_terminal = (timestep < n_steps - self.velocity_in_value).float()
+                # line 7: tau / (2 * s_t^2) * (x_t - x_{t+1})^2
                 target += running_cost * self.tau2 * non_terminal
 
             if self.entropy_in_value or self.entropy_in_value == 0:
                 # do not add entropy to target for the "entropy_in_value" number of last steps 
                 assert isinstance(self.entropy_in_value, int), "self.entropy_in_value should be interger"
                 non_terminal = (timestep < n_steps - self.entropy_in_value).float() 
+                # Line 7: tau * log(pi(x_{t + 1} | x_t)), simplifies to log(sigma_t) since Gaussian
                 target -= entropy * self.tau1 * non_terminal 
             self.v.train()
+            # Line 7: V^t(x_t)
             v_xt = self.v(state, timestep).squeeze()
-            v_loss = F.mse_loss(v_xt, target.detach())
+            v_loss = F.mse_loss(v_xt, target.detach()) # This is Line 7. 
             v_loss.backward()
             if self.value_grad_clip:
                 torch.nn.utils.clip_grad_norm_(self.v.parameters(), 0.1)
@@ -345,7 +367,8 @@ class DxMI_Trainer:
                 d_energy[f'adavelreg/beta{t}_'] = beta.item()
         
         return d_energy
-    
+
+    ### SAMPLER UPDATE ###
     def update_sampler(self, state_dict, n_generator, d_sample=None):
         if self.f is not None:
             self.f.eval()
@@ -366,21 +389,26 @@ class DxMI_Trainer:
             running_cost = self.get_running_cost(state, next_state, pred_mean, pred_std, t)
 
             causal_entropy = torch.log(pred_std.squeeze())
-            if self.f is None:
+            if self.f is None: # use value function if no energy model
                 sampler_value_loss = self.v(next_state, t + 1).squeeze()
             else:
+                # none of samples are at the final step, so just use value function
                 if (t == self.n_timesteps - 1).sum() == 0:
                     f_state = torch.tensor([])
                     v_state = self.v(next_state, t+1).flatten()
+                # all of samples are at final step, so can only use energy function
                 elif (t != self.n_timesteps - 1).sum() == 0:
                     f_state = self.f(next_state).flatten()
                     v_state = torch.tensor([])
+                # general case, use both energy and value function 
+                # some samples are at the final step, some are not
                 else:
                     f_state = self.f(next_state[t == self.n_timesteps - 1]).flatten()
                     v_state = self.v(next_state[t != self.n_timesteps - 1], t[t!= self.n_timesteps-1]+1).flatten()
                 sampler_value_loss = torch.cat((f_state, v_state)).mean()
 
             non_terminal = (t < self.n_timesteps - self.skip_sampler_tau).float()
+            # Line 11: V^(t+1)(x_{t+1}) + tau * log(pi(x_{t + 1} | x_t)) + velocity cost
             sampler_loss = (
                 sampler_value_loss
                 + (running_cost * self.tau2 - causal_entropy * self.tau1) * non_terminal
